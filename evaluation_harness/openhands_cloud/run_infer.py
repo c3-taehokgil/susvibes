@@ -3,13 +3,26 @@
 
 See README.md for the two-adapter shape this harness has to bridge: SusVibes instances are
 keyed by a Docker `image_name` (base_commit + task_patch/mask_patch already applied); OpenHands
-Cloud only runs against a GitHub `selected_repository` + `selected_branch`. So each instance:
+Cloud has no "run against this arbitrary image" mode. So each instance:
 
   1. extract_image_to_dir()   -- pull the instance's exact starting tree out of image_name
-  2. prepare_repo_branch()    -- push that tree as a scratch branch Cloud has repo access to
-  3. create + poll a Cloud conversation against that branch
-  4. extract_patch()          -- `git diff` inside the live sandbox (no PR needed)
-  5. write {instance_id, model_name_or_path, model_patch} to predictions.jsonl
+  2. prepare_repo_branch()    -- push that tree as a scratch branch to `--mirror_repo`
+  3. create a bare Cloud conversation (no selected_repository/git_provider -- this deployment
+     has no GitHub-App/OAuth linking, only per-secret tokens under Settings -> Secrets), whose
+     prompt's first step tells the agent to clone `--mirror_repo` itself using a secret token
+     (`--secret_name`, e.g. SUSVIBES_SCRATCH_TOKEN) already present in its sandbox env
+  4. wait_for_start_task_ready(), then poll get_conversation()'s `execution_status`
+  5. extract_patch()          -- `git diff` inside the live sandbox (no PR needed)
+  6. write {instance_id, model_name_or_path, model_patch} to predictions.jsonl
+
+Confirmed end-to-end against openhands.c3ci.cloud with a hand-run smoke test (clone + write +
+commit + push all succeeded). Two non-obvious things that cost real debugging time, kept here
+as comments so they aren't rediscovered:
+  - This deployment's /api/v1/app-conversations rejects the client's default
+    `Authorization: Bearer` header with 401 NoCredentialsError; it wants `X-Session-API-Key`.
+  - `OpenHandsClient.get_comprehensive_conversation_events()` is unusable here: its app/agent/
+    trajectory event-fetching fallbacks 422/500/crash respectively, so it always returns zero
+    events. Poll `get_conversation()`'s own `execution_status` field instead.
 
 This is a sketch: the mirror-repo push (step 2) assumes ambient git credentials and does no
 retry/locking, and there is no convert.py yet for the standard trajectory format (see README).
@@ -19,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -28,6 +42,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+from dotenv import load_dotenv
+
+# By exact path, not the default search -- load_dotenv() with no path walks up from the
+# CALLER's file location, which for a real .py file is fine here (this file sits next to
+# its own .env), but do it explicitly anyway so it doesn't depend on cwd or import order.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common import apply_safety_hint, get_instance_template  # noqa: E402
@@ -48,6 +69,23 @@ except ImportError as exc:  # pragma: no cover
 TERMINAL_ERROR_STATUSES = {"error", "failed", "stuck"}
 DEFAULT_TIMEOUT_SEC = 2 * 60 * 60
 DEFAULT_POLL_INTERVAL_SEC = 15.0
+DEFAULT_SECRET_NAME = "SUSVIBES_SCRATCH_TOKEN"
+
+
+# ── Client ──
+
+
+def make_client(timeout: float) -> OpenHandsClient:
+    """Build an OpenHandsClient using X-Session-API-Key.
+
+    The client's default `Authorization: Bearer <ACA_API_KEY>` header is rejected by this
+    deployment's /api/v1/app-conversations with a 401 NoCredentialsError; it expects the
+    same key under X-Session-API-Key instead.
+    """
+    return OpenHandsClient(
+        headers={"X-Session-API-Key": os.getenv("ACA_API_KEY")},
+        timeout=timeout,
+    )
 
 
 # ── Step 1: pull the instance's exact starting tree out of the Docker image ──
@@ -69,7 +107,7 @@ def extract_image_to_dir(image_name: str, dest: Path, container_work_dir: str = 
         subprocess.run(["docker", "rm", tmp_container], capture_output=True)
 
 
-# ── Step 2: push that tree as a scratch branch OpenHands Cloud can see ──
+# ── Step 2: push that tree as a scratch branch OpenHands Cloud can clone ──
 
 
 def prepare_repo_branch(
@@ -118,16 +156,23 @@ def delete_remote_branch(mirror_repo: str, branch_name: str, workspace_root: Pat
 # ── Prompt ──
 
 
-def build_prompt(instance: dict, mirror_repo: str, strategy: str) -> str:
+def build_prompt(instance: dict, mirror_repo: str, branch: str, secret_name: str, strategy: str) -> str:
     repo_name = mirror_repo.split("/")[-1]
     work_dir = f"/workspace/{repo_name}"
+    clone_preamble = (
+        "Before doing anything else, run exactly these bash commands to prepare your "
+        "workspace. If any of them fail, stop and report the error instead of continuing:\n\n"
+        f"  git clone https://${{{secret_name}}}@github.com/{mirror_repo}.git {work_dir}\n"
+        f"  cd {work_dir}\n"
+        f"  git checkout {branch}\n\n"
+    )
     problem_statement = instance["problem_statement"]
     if strategy != "none":
         problem_statement = apply_safety_hint(problem_statement)
-    return get_instance_template(work_dir, problem_statement)
+    return clone_preamble + get_instance_template(work_dir, problem_statement)
 
 
-# ── Steps 3-4: run the conversation and pull the diff back out ──
+# ── Steps 3-5: run the conversation and pull the diff back out ──
 
 
 def wait_for_completion(
@@ -137,20 +182,18 @@ def wait_for_completion(
     timeout: float,
     poll_interval: float,
 ) -> None:
-    """Poll conversation events for `execution_status` until `finished`, or raise.
+    """Poll get_conversation()'s `execution_status` field until `finished`, or raise.
 
-    Reimplements (on the public API) the same signal `remote_openhands` uses internally in
-    `OpenHandsClient.send_message(wait_for_response=True)` -- reading it directly here since
-    `create_conversation(..., initial_message={"run": True})` already triggers the run, so we
-    only need to *wait*, not send another message.
+    Deliberately NOT using get_comprehensive_conversation_events() / events-search: on this
+    deployment every fallback that method tries is broken (app: 422 from a `limit=200` the
+    server caps at 100; agent: 500; trajectory: a client-side parsing crash), so it silently
+    returns zero events forever. get_conversation()'s own execution_status field is unaffected
+    by any of that.
     """
     deadline = time.time() + timeout
     latest_status: str | None = None
     while time.time() < deadline:
-        events = client.get_comprehensive_conversation_events(conversation_id)["events"]
-        for ev in events:  # chronologically ascending; last match wins
-            if ev.get("kind") == "ConversationStateUpdateEvent" and ev.get("key") == "execution_status":
-                latest_status = str(ev.get("value", "")).lower()
+        latest_status = str(client.get_conversation(conversation_id).get("execution_status") or "").lower()
         if latest_status == "finished":
             return
         if latest_status in TERMINAL_ERROR_STATUSES:
@@ -194,16 +237,12 @@ def process_instance(
     try:
         repo, branch = prepare_repo_branch(instance, args.mirror_repo, workspace_root)
 
-        client = OpenHandsClient(timeout=args.timeout)
-        prompt = build_prompt(instance, repo, args.strategy)
-        client.create_conversation(
-            initial_msg=prompt,
-            selected_repository=repo,
-            selected_branch=branch,
-            git_provider=args.git_provider,
-            agent=args.agent,
-            title=instance_id,
-        )
+        client = make_client(timeout=args.timeout)
+        prompt = build_prompt(instance, repo, branch, args.secret_name, args.strategy)
+        client.create_conversation(initial_msg=prompt, agent=args.agent, title=instance_id)
+        start_task_id = client.conversation_id
+
+        client.wait_for_start_task_ready(start_task_id, timeout=min(args.timeout, 300))
         cid = client.conversation_id
 
         wait_for_completion(client, cid, timeout=args.timeout, poll_interval=args.poll_interval)
@@ -247,8 +286,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_path", type=Path, required=True)
     p.add_argument("--output_dir", type=Path, required=True)
     p.add_argument("--mirror_repo", type=str, required=True,
-        help="owner/name of a scratch GitHub repo your OpenHands Cloud account/org has provider access to.")
-    p.add_argument("--git_provider", type=str, default="github")
+        help="owner/name of a scratch GitHub repo the harness can push to.")
+    p.add_argument("--secret_name", type=str, default=DEFAULT_SECRET_NAME,
+        help="Name of the OpenHands Cloud secret (Settings -> Secrets) holding a GitHub "
+             "token scoped to --mirror_repo; the agent uses it to clone.")
     p.add_argument("--agent", type=str, default=None, help="Cloud agent id; default is server-side default.")
     p.add_argument("--model_name_or_path", type=str, default="openhands-cloud")
     p.add_argument("--strategy", type=str, default="none", choices=["none", "generic"])
