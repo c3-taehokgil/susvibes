@@ -9,6 +9,7 @@ build_prompt()'s template substitution, against a fake OpenHandsClient. Run with
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_infer  # noqa: E402
 from remote_openhands import OpenHandsAPIError, OpenHandsTimeoutError  # noqa: E402
+
+
+# ── format_error ──
+
+
+def test_format_error_includes_called_process_error_stderr():
+    exc = subprocess.CalledProcessError(
+        1, ["docker", "create", "some-image"], output=b"", stderr=b"no such image: some-image\n"
+    )
+    msg = run_infer.format_error(exc)
+    assert "no such image: some-image" in msg
+
+
+def test_format_error_falls_back_to_str_for_other_exceptions():
+    assert run_infer.format_error(ValueError("plain message")) == "plain message"
 
 
 # ── wait_for_completion ──

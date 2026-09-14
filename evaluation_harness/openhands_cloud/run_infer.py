@@ -102,7 +102,7 @@ def extract_image_to_dir(image_name: str, dest: Path, container_work_dir: str = 
     try:
         subprocess.run(
             ["docker", "cp", f"{tmp_container}:{container_work_dir}/.", str(dest)],
-            check=True,
+            capture_output=True, text=True, check=True,
         )
     finally:
         subprocess.run(["docker", "rm", tmp_container], capture_output=True)
@@ -225,6 +225,18 @@ def extract_patch(client: OpenHandsClient, conversation_id: str, workspace_dir: 
 # ── Per-instance orchestration ──
 
 
+def format_error(exc: Exception) -> str:
+    """str(exc) drops CalledProcessError's actual stderr (just says "exit status N") --
+    include it so a Docker/git failure is diagnosable straight from predictions.jsonl."""
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = exc.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        if stderr:
+            return f"{exc}: {stderr.strip()}"
+    return str(exc)
+
+
 def process_instance(
     instance: dict,
     args: argparse.Namespace,
@@ -261,7 +273,7 @@ def process_instance(
             "instance_id": instance_id,
             "model_name_or_path": model_name,
             "model_patch": "",
-            "error": str(exc),
+            "error": format_error(exc),
         }
     finally:
         if client is not None and client.conversation_id and not args.keep_conversations:
@@ -318,11 +330,20 @@ def main() -> None:
     else:
         instances = instances[args.start_idx: args.start_idx + args.num_instances]
 
-    # Skip instances already present from a prior (possibly killed) run.
+    # Skip instances that already SUCCEEDED in a prior (possibly killed) run. A prior
+    # errored attempt is retried -- its stale line stays in the file, but susvibes.eval.core
+    # (and our own resume check here, on a later run) key by instance_id last-one-wins, so
+    # the fresh result simply supersedes it.
     done_ids: set[str] = set()
     if predictions_path.exists():
         with open(predictions_path) as f:
-            done_ids = {json.loads(line)["instance_id"] for line in f if line.strip()}
+            for line in f:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("error"):
+                    continue
+                done_ids.add(record["instance_id"])
         instances = [i for i in instances if i["instance_id"] not in done_ids]
 
     print(f"### PREDICTIONS FILE: {predictions_path} ###")
