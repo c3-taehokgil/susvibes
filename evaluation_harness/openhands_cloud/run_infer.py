@@ -50,10 +50,11 @@ from dotenv import load_dotenv
 # its own .env), but do it explicitly anyway so it doesn't depend on cwd or import order.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
+# Both paths must be inserted before either import -- common.py itself needs susvibes'
+# repo root on sys.path (it imports susvibes.eval.strategies.prompts at module load time).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common import apply_safety_hint, get_instance_template  # noqa: E402
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from common import apply_safety_hint, get_instance_template  # noqa: E402
 from susvibes.core.utils import resolve_image_name  # noqa: E402
 
 try:
