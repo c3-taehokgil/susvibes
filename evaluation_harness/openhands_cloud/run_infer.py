@@ -7,10 +7,11 @@ Cloud has no "run against this arbitrary image" mode. So each instance:
 
   1. extract_image_to_dir()   -- pull the instance's exact starting tree out of image_name
   2. prepare_repo_branch()    -- push that tree as a scratch branch to `--mirror_repo`
+     (authenticated with `SUSVIBES_SCRATCH_TOKEN` from this directory's `.env`)
   3. create a bare Cloud conversation (no selected_repository/git_provider -- this deployment
      has no GitHub-App/OAuth linking, only per-secret tokens under Settings -> Secrets), whose
      prompt's first step tells the agent to clone `--mirror_repo` itself using a secret token
-     (`--secret_name`, e.g. SUSVIBES_SCRATCH_TOKEN) already present in its sandbox env
+     (`--secret_name`, default `SUSVIBES_SCRATCH_TOKEN`) already present in its sandbox env
   4. wait_for_start_task_ready(), then poll get_conversation()'s `execution_status`
   5. extract_patch()          -- `git diff` inside the live sandbox (no PR needed)
   6. write {instance_id, model_name_or_path, model_patch} to predictions.jsonl
@@ -24,8 +25,8 @@ as comments so they aren't rediscovered:
     trajectory event-fetching fallbacks 422/500/crash respectively, so it always returns zero
     events. Poll `get_conversation()`'s own `execution_status` field instead.
 
-This is a sketch: the mirror-repo push (step 2) assumes ambient git credentials and does no
-retry/locking, and there is no convert.py yet for the standard trajectory format (see README).
+This is a sketch: the mirror-repo push (step 2) does no retry/locking, and there is no
+convert.py yet for the standard trajectory format (see README).
 """
 
 from __future__ import annotations
@@ -70,10 +71,30 @@ except ImportError as exc:  # pragma: no cover
 TERMINAL_ERROR_STATUSES = {"error", "failed", "stuck"}
 DEFAULT_TIMEOUT_SEC = 2 * 60 * 60
 DEFAULT_POLL_INTERVAL_SEC = 15.0
+# Same name as the `.env` key used for local mirror pushes, and as the OpenHands Cloud
+# Settings → Secrets entry the agent reads when cloning (`${SUSVIBES_SCRATCH_TOKEN}`).
 DEFAULT_SECRET_NAME = "SUSVIBES_SCRATCH_TOKEN"
 
 
-# ── Client ──
+# ── Client / credentials ──
+
+
+def require_scratch_token() -> str:
+    """Return `SUSVIBES_SCRATCH_TOKEN` from the environment (this directory's `.env`)."""
+    token = os.getenv(DEFAULT_SECRET_NAME)
+    if not token:
+        raise RuntimeError(
+            f"{DEFAULT_SECRET_NAME} is not set. Add it to evaluation_harness/openhands_cloud/.env "
+            "(a fine-grained PAT scoped to --mirror_repo). Use the same name for the OpenHands "
+            "Cloud Settings → Secrets entry the agent clones with."
+        )
+    return token
+
+
+def mirror_repo_url(mirror_repo: str, token: str | None = None) -> str:
+    """HTTPS remote URL for `mirror_repo` authenticated with `SUSVIBES_SCRATCH_TOKEN`."""
+    token = token if token is not None else require_scratch_token()
+    return f"https://x-access-token:{token}@github.com/{mirror_repo}.git"
 
 
 def make_client(timeout: float) -> OpenHandsClient:
@@ -120,7 +141,8 @@ def prepare_repo_branch(
 
     Returns (mirror_repo, branch_name). `branch_name` is derived from `instance_id` and is
     assumed not to already exist on `mirror_repo` (this is a scratch mirror, not the upstream
-    project repo) -- pushes with `--force` to make reruns idempotent.
+    project repo) -- pushes with `--force` to make reruns idempotent. Auth uses
+    `SUSVIBES_SCRATCH_TOKEN` from `.env` (not ambient git credentials).
     """
     instance_id = instance["instance_id"]
     branch_name = f"susvibes/{instance_id}"
@@ -140,8 +162,8 @@ def prepare_repo_branch(
     git("add", "-A")
     git("-c", "user.name=susvibes", "-c", "user.email=susvibes@localhost",
         "commit", "-q", "-m", f"SusVibes starting state for {instance_id}", "--allow-empty")
-    git("remote", "add", "origin", f"https://github.com/{mirror_repo}.git")
-    git("push", "-q", "-f", "origin", f"HEAD:{branch_name}")
+    # Authenticate the push via URL (do not store the token in a named remote / .git/config).
+    git("push", "-q", "-f", mirror_repo_url(mirror_repo), f"HEAD:{branch_name}")
 
     return mirror_repo, branch_name
 
@@ -149,7 +171,7 @@ def prepare_repo_branch(
 def delete_remote_branch(mirror_repo: str, branch_name: str, workspace_root: Path) -> None:
     """Best-effort cleanup of the scratch branch pushed by prepare_repo_branch()."""
     subprocess.run(
-        ["git", "push", "-q", f"https://github.com/{mirror_repo}.git", "--delete", branch_name],
+        ["git", "push", "-q", mirror_repo_url(mirror_repo), "--delete", branch_name],
         cwd=workspace_root, capture_output=True,
     )
 
@@ -301,8 +323,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mirror_repo", type=str, required=True,
         help="owner/name of a scratch GitHub repo the harness can push to.")
     p.add_argument("--secret_name", type=str, default=DEFAULT_SECRET_NAME,
-        help="Name of the OpenHands Cloud secret (Settings -> Secrets) holding a GitHub "
-             "token scoped to --mirror_repo; the agent uses it to clone.")
+        help="Name of the OpenHands Cloud secret (Settings -> Secrets) the agent reads when "
+             "cloning; default SUSVIBES_SCRATCH_TOKEN (same key as in this directory's .env).")
     p.add_argument("--agent", type=str, default=None, help="Cloud agent id; default is server-side default.")
     p.add_argument("--model_name_or_path", type=str, default="openhands-cloud")
     p.add_argument("--strategy", type=str, default="none", choices=["none", "generic"])
@@ -320,6 +342,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_scratch_token()  # fail fast before spinning up workers / Docker
     args.output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = args.output_dir / "predictions.jsonl"
     workspace_root = Path(tempfile.mkdtemp(prefix="openhands_cloud_"))

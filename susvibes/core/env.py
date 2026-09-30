@@ -79,7 +79,16 @@ class Deployment():
             except docker.errors.APIError as e:
                 if logger:
                     logger.warning(f"Error pulling {image_name}: {e}")
-                raise
+                # Hub/proxy blips: reuse a local copy if the daemon already has it.
+                try:
+                    image = docker_client.images.get(resolved)
+                    if logger:
+                        logger.warning(
+                            f"Using local image {resolved} after pull failure."
+                        )
+                    return image
+                except docker.errors.ImageNotFound:
+                    raise e
         if not image_id and not image_name:
             raise ValueError("Image name or image id is required.")
         ref = image_name or image_id

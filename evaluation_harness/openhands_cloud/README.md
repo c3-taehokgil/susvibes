@@ -34,16 +34,17 @@ image_name (Docker)  --extract-->  local worktree  --push branch-->  mirror repo
   `bou2_openhands` via Poetry, which pulls it in as an editable dependency).
 - **Python 3.12** (not the 3.11 the main SusVibes README suggests — `remote_openhands` requires
   `>=3.12`).
-- `ACA_API_URL` / `ACA_API_KEY` in a `.env` **in this directory** (next to `run_infer.py` —
-  `load_dotenv()` resolves relative to the calling file's location, not your shell's cwd, so
-  it has to live here specifically, not e.g. the repo root or a script elsewhere).
-- `docker` and `git` on PATH, with local push access to `--mirror_repo`.
+- `ACA_API_URL` / `ACA_API_KEY` / `SUSVIBES_SCRATCH_TOKEN` in a `.env` **in this directory**
+  (next to `run_infer.py` — `load_dotenv()` resolves relative to the calling file's location,
+  not your shell's cwd, so it has to live here specifically, not e.g. the repo root or a script
+  elsewhere). `SUSVIBES_SCRATCH_TOKEN` is a fine-grained PAT scoped to *only* `--mirror_repo`
+  (Contents + Workflows read/write); the harness uses it for local `git push` / branch cleanup.
+- `docker` and `git` on PATH.
 - A **scratch mirror repo** (`--mirror_repo owner/name`) — just an empty throwaway repo. It is
   *not* the original upstream project repo.
-- A **secret** in OpenHands Cloud Settings → Secrets (name matches `--secret_name`, default
-  `SUSVIBES_SCRATCH_TOKEN`) holding a GitHub token scoped to *only* `--mirror_repo`
-  (fine-grained PAT, Contents: Read and write is enough). Don't reuse a broader shared
-  `GITHUB_TOKEN` secret that's scoped to a different org/project — add a separate one.
+- A **secret** in OpenHands Cloud Settings → Secrets named `SUSVIBES_SCRATCH_TOKEN` (or
+  matching `--secret_name`) holding the **same** PAT, so the agent can clone inside its
+  sandbox. Don't reuse a broader shared token scoped to a different org/project.
 
 ## Run
 
@@ -51,7 +52,6 @@ image_name (Docker)  --extract-->  local worktree  --push branch-->  mirror repo
 python run_infer.py \
     --dataset_path ../../datasets/default/susvibes_dataset.jsonl \
     --mirror_repo your-org/susvibes-scratch \
-    --secret_name SUSVIBES_SCRATCH_TOKEN \
     --output_dir logs/openhands_cloud/default \
     --max_workers 4
 ```
@@ -83,8 +83,8 @@ approach here is unnecessary complexity you could drop).
 
 ## Known gaps (this is a sketch, not a hardened harness)
 
-- `prepare_repo_branch()` pushes with a plain `git push`; it doesn't handle auth, rate limits,
-  or repos that already contain the branch name.
+- `prepare_repo_branch()` pushes with `SUSVIBES_SCRATCH_TOKEN` in the remote URL; it doesn't
+  handle rate limits or repos that already contain the branch name beyond `--force`.
 - No `convert.py` yet — `predictions.jsonl` is all `susvibes.eval.core` needs, but there's no
   trajectory export to the [standard format](../TRAJECTORY_FORMAT.md) for leaderboard tooling.
 - Only validated on a hand-run smoke test (clone + write + commit + push, and a bare

@@ -269,6 +269,18 @@ class TasksHandler:
             logger.error(msg)
             raise RuntimeError(msg)
 
+        report_path = log_dir / LOG_REPORT
+        if report_path.exists() and not force:
+            logger.info(f"Report found; reusing.")
+            report = load_file(report_path)
+            if self.strategy == Strategies.SELF_SELECTION:
+                # CWE selection stats need Task.cwe_ids; load from the dataset row.
+                report["cwe_selection"] = eval_selected_cwes(
+                    prediction, data_record["cwe_ids"]
+                )
+            logger.info(f"Report for {instance_id}: {report}")
+            return report
+
         logger.info(f"Initializing {instance_id}...")
         env_spec = self.env_specs[instance_id]
         try:

@@ -160,3 +160,27 @@ def test_build_prompt_applies_safety_hint_only_for_generic_strategy():
     generic_prompt = run_infer.build_prompt(instance, "acme/repo", "branch", "TOKEN", strategy="generic")
     assert generic_prompt != none_prompt
     assert len(generic_prompt) > len(none_prompt)
+
+
+# ── SUSVIBES_SCRATCH_TOKEN / mirror_repo_url ──
+
+
+def test_require_scratch_token_returns_env_value(monkeypatch):
+    monkeypatch.setenv("SUSVIBES_SCRATCH_TOKEN", "ghp_test_token")
+    assert run_infer.require_scratch_token() == "ghp_test_token"
+
+
+def test_require_scratch_token_raises_when_missing(monkeypatch):
+    monkeypatch.delenv("SUSVIBES_SCRATCH_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="SUSVIBES_SCRATCH_TOKEN"):
+        run_infer.require_scratch_token()
+
+
+def test_mirror_repo_url_embeds_token(monkeypatch):
+    monkeypatch.setenv("SUSVIBES_SCRATCH_TOKEN", "ghp_test_token")
+    url = run_infer.mirror_repo_url("acme/susvibes-scratch")
+    assert url == "https://x-access-token:ghp_test_token@github.com/acme/susvibes-scratch.git"
+
+
+def test_default_secret_name_is_susvibes_scratch_token():
+    assert run_infer.DEFAULT_SECRET_NAME == "SUSVIBES_SCRATCH_TOKEN"
